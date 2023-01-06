@@ -34,7 +34,174 @@ if (configFile !== false) {
 
 > 第一步是解析配置文件的内容，然后与命令行配置合并。值得注意的是，后面有一个记录 `configFileDependencies` 的操作。因为配置文件代码可能会有第三方库的依赖，所以当第三方库依赖的代码更改时，Vite 可以通过 HMR 处理逻辑中记录的 `configFileDependencies` 检测到更改，再重启 `DevServer` ，来保证当前生效的配置永远是`最新`的
 
-### vite 解析用户插件
+**loadConfigFromFile 实现**
+
+```ts
+// 这是我们的文件命名
+export const DEFAULT_CONFIG_FILES = [
+  'vite.config.js',
+  'vite.config.mjs',
+  'vite.config.ts',
+  'vite.config.cjs',
+  'vite.config.mts',
+  'vite.config.cts',
+];
+
+export async function loadConfigFromFile(
+  configEnv: ConfigEnv,
+  configFile?: string,
+  configRoot: string = process.cwd(),
+  logLevel?: LogLevel,
+): Promise<{
+  path: string;
+  config: UserConfig;
+  dependencies: string[];
+} | null> {
+  const start = performance.now();
+  const getTime = () => `${(performance.now() - start).toFixed(2)}ms`;
+
+  // 处理的config 文件lujing
+  let resolvedPath: string | undefined;
+
+  if (configFile) {
+    // 存在 用户自定义的 --config
+    resolvedPath = path.resolve(configFile);
+  } else {
+    // 不存在就从 DEFAULT_CONFIG_FILES 去匹配 , 默认是在根目录下的
+    for (const filename of DEFAULT_CONFIG_FILES) {
+      const filePath = path.resolve(configRoot, filename);
+      // 不存在就是 继续遍历
+      if (!fs.existsSync(filePath)) continue;
+
+      // 找到了就退出
+      resolvedPath = filePath;
+      break;
+    }
+  }
+
+  // 如果不存在 就抛出
+  if (!resolvedPath) {
+    debug('no config file found.');
+    return null;
+  }
+
+  // 判断是否是 esmodule
+  let isESM = false;
+  if (/\.m[jt]s$/.test(resolvedPath)) {
+    // 文件后缀 是 mjs/mts 说明是 esmodule
+    isESM = true;
+  } else if (/\.c[jt]s$/.test(resolvedPath)) {
+    // cjs / cts 说明不是
+    isESM = false;
+  } else {
+    // 会尝试获取 package.json 中的 type 字段 如果是 module 也说明是 esmodule
+    try {
+      const pkg = lookupFile(configRoot, ['package.json']);
+      isESM = !!pkg && JSON.parse(pkg).type === 'module';
+    } catch (e) {}
+  }
+
+  try {
+    /**
+     * bundleConfigFile 会把配置文件 使用esbuild 打包
+     */
+    const bundled = await bundleConfigFile(resolvedPath, isESM);
+    /**
+     * 加载编译后的 bundle 代码 返回 用户的config (对象或者 方法)
+     */
+    const userConfig = await loadConfigFromBundledFile(
+      resolvedPath,
+      bundled.code,
+      isESM,
+    );
+    debug(`bundled config file loaded in ${getTime()}`);
+
+    // 赋值
+    const config = await (typeof userConfig === 'function'
+      ? userConfig(configEnv)
+      : userConfig);
+    if (!isObject(config)) {
+      throw new Error(`config must export or return an object.`);
+    }
+    return {
+      path: normalizePath(resolvedPath),
+      config,
+      dependencies: bundled.dependencies, // 记录依赖
+    };
+  } catch (e) {
+    createLogger(logLevel).error(
+      colors.red(`failed to load config from ${resolvedPath}`),
+      { error: e },
+    );
+    throw e;
+  }
+}
+```
+
+**loadConfigFromBundledFile 实现**
+
+```ts
+const _require = createRequire(import.meta.url);
+async function loadConfigFromBundledFile(
+  fileName: string,
+  bundledCode: string,
+  isESM: boolean,
+): Promise<UserConfigExport> {
+  if (isESM) {
+    // 如果是 esmodule
+    /**
+     *  会将编译后的 js 代码写入临时文件，通过 Node 原生 ESM Import 来读取这个临时的内容，以获取到配置内容，再直接删掉临时文件
+     */
+    const fileBase = `${fileName}.timestamp-${Date.now()}`;
+    const fileNameTmp = `${fileBase}.mjs`;
+    const fileUrl = `${pathToFileURL(fileBase)}.mjs`;
+    fs.writeFileSync(fileNameTmp, bundledCode);
+    try {
+      return (await dynamicImport(fileUrl)).default;
+    } finally {
+      try {
+        fs.unlinkSync(fileNameTmp);
+      } catch {}
+    }
+  } else {
+    // 处理 cjs/cts
+    // 大体的思路是通过拦截原生 require.extensions 的加载函数来实现对 bundle 后配置代码的加载
+    const extension = path.extname(fileName); // 取出后缀
+    const realFileName = fs.realpathSync(fileName);
+    const loaderExt = extension in _require.extensions ? extension : '.js'; // 是否存在对应的loader
+    const defaultLoader = _require.extensions[loaderExt]!; // 默认的加载器
+    // 拦截原生 require 对于`.js`或者`.ts`的加载
+    _require.extensions[loaderExt] = (module: NodeModule, filename: string) => {
+      if (filename === realFileName) {
+        // 针对 vite 配置文件的加载特殊处理
+        (module as NodeModuleWithCompile)._compile(bundledCode, filename);
+      } else {
+        defaultLoader(module, filename);
+      }
+    };
+    // 清除这个文件的缓存
+    delete _require.cache[_require.resolve(fileName)];
+    // 在调用完 module._compile 编译完配置代码后，进行一次手动的 require，即可拿到配置对象
+    const raw = _require(fileName);
+    // 恢复原生的加载方法
+    _require.extensions[loaderExt] = defaultLoader;
+    return raw.__esModule ? raw.default : raw;
+  }
+}
+
+// 原生 require 对于 js 文件的加载代码
+Module._extensions['.js'] = function (module, filename) {
+  var content = fs.readFileSync(filename, 'utf8');
+  module._compile(stripBOM(content), filename);
+};
+
+// module._compile 相当于手动编译一个模块，该方法在 Node 内部的实现如下
+Module.prototype._compile = function (content, filename) {
+  var self = this;
+  var args = [self.exports, require, self, filename, dirname];
+  return compiledWrapper.apply(self.exports, args);
+};
+```
 
 第二个重点环节是 解析用户插件。首先，我们通过 `apply` 参数 过滤出需要生效的用户插件。为什么这么做呢？因为有些插件只在开发阶段生效，或者说只在生产环境生效，我们可以通过 apply: 'serve' 或 'build' 来指定它们，同时也可以将 apply 配置为一个函数，来自定义插件生效的条件
 
@@ -269,3 +436,164 @@ assetsInclude(file: string) {
 ```
 
 ### vite 路径解析器工厂
+
+这里所说的`路径解析器`，是指调用`插件容器`进行路径解析的函数
+
+```ts
+// 用于处理特殊场景
+// 比如用于处理 optimizer, css @imports
+const createResolver: ResolvedConfig['createResolver'] = (options) => {
+  let aliasContainer: PluginContainer | undefined;
+  let resolverContainer: PluginContainer | undefined;
+  // 返回的函数可以理解为一个解析器
+  return async (id, importer, aliasOnly, ssr) => {
+    let container: PluginContainer;
+    if (aliasOnly) {
+      container =
+        aliasContainer ||
+        // 新建 aliasContainer
+        (aliasContainer = await createPluginContainer({
+          ...resolved,
+          plugins: [aliasPlugin({ entries: resolved.resolve.alias })],
+        }));
+    } else {
+      container =
+        resolverContainer ||
+        // 新建 resolverContainer
+        (resolverContainer = await createPluginContainer({
+          ...resolved,
+          plugins: [
+            aliasPlugin({ entries: resolved.resolve.alias }),
+            resolvePlugin({
+              ...resolved.resolve,
+              root: resolvedRoot,
+              isProduction,
+              isBuild: command === 'build',
+              ssrConfig: resolved.ssr,
+              asSrc: true,
+              preferRelative: false,
+              tryIndex: true,
+              ...options,
+            }),
+          ],
+        }));
+    }
+    return (
+      await container.resolveId(id, importer, {
+        ssr,
+        scan: options?.scan,
+      })
+    )?.id;
+  };
+};
+```
+
+这个解析器未来会在依赖预构建的时候用上，具体用法如下:
+
+```ts
+const resolve = config.createResolver();
+// 调用以拿到 react 路径
+rseolve('react', undefined, undefined, false);
+```
+
+这里有 `aliasContainer` 和 `resolverContainer` 两个工具对象，它们都含有 `resolveId` 这个专门解析路径的方法，可以被 Vite 调用来获取解析结果
+
+接着会顺便处理一个 `public` 目录，也就是 Vite 作为静态资源服务的目录
+
+```ts
+const { publicDir } = config;
+const resolvedPublicDir =
+  publicDir !== false && publicDir !== ''
+    ? path.resolve(
+        resolvedRoot,
+        typeof publicDir === 'string' ? publicDir : 'public',
+      )
+    : '';
+```
+
+中间还有 处理 `server`, `workerConfig` 自己瞅瞅源码
+
+最后通过 `resolved` 对象来整理一下
+
+```ts
+const resolvedConfig: ResolvedConfig = {
+  configFile: configFile ? normalizePath(configFile) : undefined,
+  configFileDependencies: configFileDependencies.map((name) =>
+    normalizePath(path.resolve(name)),
+  ),
+  inlineConfig,
+  root: resolvedRoot,
+  base: resolvedBase.endsWith('/') ? resolvedBase : resolvedBase + '/',
+  rawBase: resolvedBase,
+  resolve: resolveOptions,
+  publicDir: resolvedPublicDir,
+  cacheDir,
+  command,
+  mode,
+  ssr,
+  isWorker: false,
+  mainConfig: null,
+  isProduction,
+  plugins: userPlugins,
+  server,
+  build: resolvedBuildOptions,
+  preview: resolvePreviewOptions(config.preview, server),
+  env: {
+    ...userEnv,
+    BASE_URL,
+    MODE: mode,
+    DEV: !isProduction,
+    PROD: isProduction,
+  },
+  assetsInclude(file: string) {
+    return DEFAULT_ASSETS_RE.test(file) || assetsFilter(file);
+  },
+  logger,
+  packageCache: new Map(),
+  createResolver,
+  optimizeDeps: {
+    disabled: 'build',
+    ...optimizeDeps,
+    esbuildOptions: {
+      preserveSymlinks: resolveOptions.preserveSymlinks,
+      ...optimizeDeps.esbuildOptions,
+    },
+  },
+  worker: resolvedWorkerOptions,
+  appType: config.appType ?? (middlewareMode === 'ssr' ? 'custom' : 'spa'),
+  experimental: {
+    importGlobRestoreExtension: false,
+    hmrPartialAccept: false,
+    ...config.experimental,
+  },
+  getSortedPlugins: undefined!,
+  getSortedPluginHooks: undefined!,
+};
+const resolved: ResolvedConfig = {
+  ...config,
+  ...resolvedConfig,
+};
+```
+
+### vite 生成插件流水线
+
+```ts
+(resolved.plugins as Plugin[]) = await resolvePlugins(
+  resolved,
+  prePlugins,
+  normalPlugins,
+  postPlugins,
+);
+
+// call configResolved hooks
+await Promise.all([
+  ...resolved
+    .getSortedPluginHooks('configResolved')
+    .map((hook) => hook(resolved)),
+  ...resolvedConfig.worker
+    .getSortedPluginHooks('configResolved')
+    .map((hook) => hook(workerResolved)),
+]);
+```
+
+先生成完整插件列表传给 `resolve.plugins`，而后调用每个插件的 `configResolved` 钩子函数
